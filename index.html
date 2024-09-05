@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPTeleprompter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.5.1/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.5.1/styles/default.min.css">
+    <style>
+        #volumeGraph {
+            border: 1px solid #ccc;
+            background-color: #f0f0f0;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 p-8">
+    <div class="max-w-4xl mx-auto bg-white rounded-xl shadow-md overflow-hidden">
+        <div class="p-8">
+            <h1 class="text-2xl font-bold mb-4">GPT-4 Mini Interface</h1>
+            <div id="chat-container" class="mb-4 h-96 overflow-y-auto border border-gray-300 rounded p-4"></div>
+            <div class="flex space-x-2 mb-4">
+                <input type="text" id="user-input" class="flex-grow border border-gray-300 rounded px-4 py-2" placeholder="Type your message here...">
+                <button onclick="sendMessage()" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Send</button>
+            </div>
+            <div class="mb-4">
+                <input type="file" id="file-upload" class="hidden" onchange="handleFileUpload()">
+                <label for="file-upload" class="cursor-pointer bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">Upload File</label>
+            </div>
+            <div class="mb-4 flex space-x-2">
+                <select id="language-select" class="border border-gray-300 rounded px-4 py-2">
+                    <option value="">Auto-detect language</option>
+                    <option value="en">English</option>
+                    <option value="es">Spanish</option>
+                    <option value="fr">French</option>
+                    <option value="de">German</option>
+                    <option value="it">Italian</option>
+                    <option value="ja">Japanese</option>
+                    <option value="ko">Korean</option>
+                    <option value="zh">Chinese</option>
+                    <option value="pt">Portuguese</option>
+                    <!-- Add more languages as needed -->
+                </select>
+                <button onclick="startTranscription()" class="bg-purple-500 text-white px-4 py-2 rounded hover:bg-purple-600">Start Transcription</button>
+            </div>
+            <div class="mb-4">
+                <canvas id="volumeGraph" width="400" height="100"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chat-container');
+        const userInput = document.getElementById('user-input');
+
+        let isTranscribing = false;
+        let socket;
+        let audioBuffer = [];
+        let lastTranscriptionTime = Date.now();
+
+        let volumeData = [];
+        const maxDataPoints = 100;
+        const canvas = document.getElementById('volumeGraph');
+        const ctx = canvas.getContext('2d');
+
+        function updateVolumeGraph(volume) {
+            volumeData.push(volume);
+            if (volumeData.length > maxDataPoints) {
+                volumeData.shift();
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.beginPath();
+            ctx.moveTo(0, canvas.height);
+
+            for (let i = 0; i < volumeData.length; i++) {
+                const x = (i / maxDataPoints) * canvas.width;
+                const y = canvas.height - (volumeData[i] * canvas.height);
+                ctx.lineTo(x, y);
+            }
+
+            ctx.lineTo(canvas.width, canvas.height);
+            ctx.fillStyle = 'rgba(0, 123, 255, 0.5)';
+            ctx.fill();
+
+            ctx.strokeStyle = 'rgba(0, 123, 255, 1)';
+            ctx.stroke();
+        }
+
+        function checkAudioLevels(audioData) {
+            const audioArray = new Float32Array(audioData);
+            const maxAmplitude = Math.max(...audioArray.map(Math.abs));
+            const rms = Math.sqrt(audioArray.reduce((sum, val) => sum + val * val, 0) / audioArray.length);
+            console.log(`Client-side - Max amplitude: ${maxAmplitude}, RMS: ${rms}`);
+            
+            // Update the volume graph
+            updateVolumeGraph(maxAmplitude);
+
+            return true; // Always return true to send audio to the API
+        }
+
+        async function sendMessage() {
+            const message = userInput.value;
+            if (!message) return;
+
+            appendMessage('user', message);
+            userInput.value = '';
+
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    messages: [{ role: 'user', content: message }]
+                }),
+            });
+
+            const data = await response.json();
+            appendMessage('assistant', data);
+        }
+
+        function appendMessage(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `mb-4 ${role === 'user' ? 'text-right' : 'text-left'}`;
+
+            const bubble = document.createElement('div');
+            bubble.className = `inline-block p-4 rounded-lg ${role === 'user' ? 'bg-blue-100' : 'bg-gray-100'}`;
+
+            if (typeof content === 'string') {
+                bubble.textContent = content;
+            } else {
+                if (content.text) {
+                    const textP = document.createElement('p');
+                    textP.textContent = content.text;
+                    bubble.appendChild(textP);
+                }
+
+                if (content.code && content.code.length > 0) {
+                    content.code.forEach(codeBlock => {
+                        const pre = document.createElement('pre');
+                        const code = document.createElement('code');
+                        code.className = `language-${codeBlock.language}`;
+                        code.textContent = codeBlock.content;
+                        pre.appendChild(code);
+                        bubble.appendChild(pre);
+                    });
+                }
+
+                if (content.lists && content.lists.length > 0) {
+                    content.lists.forEach(list => {
+                        const ul = document.createElement('ul');
+                        ul.className = 'list-disc list-inside';
+                        list.split('\n').forEach(item => {
+                            const li = document.createElement('li');
+                            li.textContent = item.replace(/^[-*]\s/, '');
+                            ul.appendChild(li);
+                        });
+                        bubble.appendChild(ul);
+                    });
+                }
+            }
+
+            messageDiv.appendChild(bubble);
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            if (typeof content !== 'string') {
+                hljs.highlightAll();
+            }
+        }
+
+        async function handleFileUpload() {
+            const fileInput = document.getElementById('file-upload');
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const fileContent = e.target.result;
+                const fileType = file.name.split('.').pop().toLowerCase();
+
+                appendMessage('user', `Uploaded file: ${file.name}`);
+
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        file_content: fileContent,
+                        file_type: fileType
+                    }),
+                });
+
+                const data = await response.json();
+                appendMessage('assistant', data);
+            };
+            reader.readAsDataURL(file);
+        }
+
+        async function startTranscription() {
+            if (isTranscribing) {
+                stopTranscription();
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const audioContext = new AudioContext();
+                const source = audioContext.createMediaStreamSource(stream);
+                
+                await audioContext.audioWorklet.addModule('audio-processor.js');
+                const processor = new AudioWorkletNode(audioContext, 'audio-processor');
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.hostname}:${window.location.port}/ws`;
+                console.log(`Attempting to connect to WebSocket at: ${wsUrl}`);
+                
+                // Get WebSocket secret
+                const response = await fetch('/ws_secret');
+                const { secret } = await response.json();
+
+                // Get selected language
+                const languageSelect = document.getElementById('language-select');
+                const selectedLanguage = languageSelect.value;
+
+                socket = new WebSocket(wsUrl);
+
+                socket.onopen = async (event) => {
+                    console.log('WebSocket connection established', event);
+                    // Send authentication message and selected language
+                    socket.send(JSON.stringify({ secret, language: selectedLanguage }));
+                    isTranscribing = true;
+                    document.querySelector('button[onclick="startTranscription()"]').textContent = 'Stop Transcription';
+                };
+
+                socket.onmessage = (event) => {
+                    console.log('WebSocket message received:', event.data);
+                    const data = JSON.parse(event.data);
+                    if (data.transcription) {
+                        appendMessage('assistant', { text: data.transcription });
+                    } else if (data.error) {
+                        appendMessage('assistant', { text: `Error: ${data.error}` });
+                    }
+                };
+
+                socket.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    appendMessage('assistant', { text: `Error: Unable to establish WebSocket connection. Please check your server configuration.` });
+                    stopTranscription();
+                };
+
+                socket.onclose = (event) => {
+                    console.log('WebSocket connection closed:', event.code, event.reason);
+                    appendMessage('assistant', { text: `WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'No reason provided'}` });
+                    stopTranscription();
+                };
+
+                processor.port.onmessage = (e) => {
+                    if (socket.readyState === WebSocket.OPEN) {
+                        checkAudioLevels(e.data.audioData);
+                        audioBuffer = audioBuffer.concat(Array.from(e.data.audioData));
+                        const currentTime = Date.now();
+                        if (audioBuffer.length >= 16000 * 30 || currentTime - lastTranscriptionTime >= 30000) {
+                            // Send audio data as binary
+                            socket.send(new Float32Array(audioBuffer).buffer);
+                            audioBuffer = [];
+                            lastTranscriptionTime = currentTime;
+                        }
+                    }
+                };
+
+            } catch (error) {
+                console.error('Error in startTranscription:', error);
+                appendMessage('assistant', { text: `Error: ${error.message}` });
+                stopTranscription();
+            }
+        }
+
+        function stopTranscription() {
+            if (socket) {
+                socket.close();
+            }
+            isTranscribing = false;
+            document.querySelector('button[onclick="startTranscription()"]').textContent = 'Start Transcription';
+            audioBuffer = [];
+        }
+
+        async function getTranscription() {
+            const response = await fetch('/get_transcription');
+            const data = await response.json();
+            if (data.transcriptions && data.transcriptions.length > 0) {
+                data.transcriptions.forEach(text => {
+                    appendMessage('assistant', { text: text });
+                });
+            }
+        }
+
+        userInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
